@@ -1,0 +1,105 @@
+name: Sync Upstream
+
+permissions:
+  contents: write
+  issues: write
+
+on:
+  schedule:
+    - cron: "0 3 */30 * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: target
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: bugswriter/dontforget
+          fetch-depth: 1
+          path: upstream
+
+      - name: Validate upstream content
+        run: |
+          if [ ! -d upstream ]; then
+            echo "Upstream checkout missing"
+            exit 1
+          fi
+          if [ -z "$(ls -A upstream)" ]; then
+            echo "Upstream repository is empty"
+            exit 1
+          fi
+
+      - name: Detect upstream changes
+        id: detect
+        run: |
+          cd upstream
+          HASH=$(tar --exclude=.git -cf - . | sha256sum | cut -d' ' -f1)
+          echo "upstream_hash=$HASH" >> $GITHUB_OUTPUT
+          cd ../target
+          if [ -f .upstream_hash ] && grep -q "$HASH" .upstream_hash; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop if no changes
+        if: steps.detect.outputs.changed == 'false'
+        run: echo "No upstream changes detected. Exiting."
+
+      - name: Create rollback tag
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          cd target
+          git tag rollback-$(date +%Y%m%d%H%M%S)
+          git push --tags
+
+      - name: Dry-run sync
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          rsync -av --delete --dry-run \
+            --exclude '.git' \
+            --exclude '.github' \
+            upstream/ target/
+
+      - name: Apply sync
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          rsync -av --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            upstream/ target/
+
+      - name: Commit and push
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          cd target
+          git diff --quiet && exit 0
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -A
+          git commit -m "Sync from upstream"
+          echo "${{ steps.detect.outputs.upstream_hash }}" > .upstream_hash
+          git add .upstream_hash
+          git commit -m "Update upstream hash"
+          git push
+
+      - name: Create failure issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "Upstream sync failed",
+              body: "Automated upstream sync failed. Check GitHub Actions logs for details."
+            })
